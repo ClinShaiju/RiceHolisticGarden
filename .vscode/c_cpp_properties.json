@@ -1,0 +1,17 @@
+{
+    "configurations": [
+        {
+            "name": "gcc",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/lvgl/**"
+            ],
+            "compilerPath": "",
+            "cStandard": "${default}",
+            "cppStandard": "${default}",
+            "intelliSenseMode": "linux-gcc-x64",
+            "compilerArgs": [""]
+        }
+    ],
+    "version": 4
+}

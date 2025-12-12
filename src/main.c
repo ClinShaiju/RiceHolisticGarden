@@ -24,7 +24,8 @@
 #include <string.h>
 
 #include "lvgl/lvgl.h"
-#include "lvgl/demos/lv_demos.h"
+// #include "lvgl/demos/lv_demos.h"
+#include "src/moisture.h"
 
 #include "src/lib/driver_backends.h"
 #include "src/lib/simulator_util.h"
@@ -82,8 +83,8 @@ static void configure_simulator(int argc, char **argv)
     const char *env_w = getenv("LV_SIM_WINDOW_WIDTH");
     const char *env_h = getenv("LV_SIM_WINDOW_HEIGHT");
     /* Default values */
-    settings.window_width = atoi(env_w ? env_w : "800");
-    settings.window_height = atoi(env_h ? env_h : "480");
+    settings.window_width = atoi(env_w ? env_w : "480");
+    settings.window_height = atoi(env_h ? env_h : "320");
 
     /* Parse the command-line options. */
     while ((opt = getopt (argc, argv, "b:fmW:H:BVh")) != -1) {
@@ -150,8 +151,11 @@ int main(int argc, char **argv)
 #endif
 
     /*Create a Demo*/
-    lv_demo_widgets();
-    lv_demo_widgets_start_slideshow();
+    // lv_demo_widgets();
+    // LV_LOG_INFO("Pixel before scaling R=%d G=%d B=%d", 1, 2, 3);
+    // lv_demo_widgets_start_slideshow();
+    ui_moisture_dashboard_absolute();
+
 
     /* Enter the run loop of the selected backend */
     driver_backends_run_loop();
