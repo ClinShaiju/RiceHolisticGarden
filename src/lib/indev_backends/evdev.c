@@ -154,7 +154,7 @@ static void set_mouse_cursor_icon(lv_indev_t *indev, lv_display_t *display)
  */
 static lv_indev_t *init_pointer_evdev(lv_display_t *display)
 {
-    const char *input_device = "/dev/input/by-path/platform-3f204000.spi-cs-1-event";
+    const char *input_device = "/dev/input/by-path/platform-xhci-hcd.0-usb-0:1:1.0-event";
 
     if (input_device == NULL) {
         LV_LOG_USER("Using evdev automatic discovery.");
@@ -167,8 +167,7 @@ static lv_indev_t *init_pointer_evdev(lv_display_t *display)
     if (indev == NULL) {
         return NULL;
     }
-    lv_evdev_set_swap_axes(indev, true);
-    lv_evdev_set_calibration(indev, 3921, 303, 331, 3752);
+
     lv_indev_set_display(indev, display);
 
     //set_mouse_cursor_icon(indev, display);
