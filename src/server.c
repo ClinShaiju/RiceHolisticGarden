@@ -169,9 +169,9 @@ static void *server_thread_fn(void *arg) {
                             maps[maps_count].last_output_state = -1;
                             maps_count++;
                         } else {
-                            /* try to find by source addr */
+                            /* try to find by source addr (IP only, ignore port since Arduino uses random source ports) */
                             int byaddr = -1;
-                            for (int i = 0; i < maps_count; ++i) if (maps[i].addr.sin_addr.s_addr == src.sin_addr.s_addr && maps[i].addr.sin_port == src.sin_port) { byaddr = i; break; }
+                            for (int i = 0; i < maps_count; ++i) if (maps[i].addr.sin_addr.s_addr == src.sin_addr.s_addr) { byaddr = i; break; }
                             if (byaddr >= 0) {
                                 add_log_to_entry(byaddr, buf);
                                 /* parse output state for byaddr */
@@ -187,10 +187,10 @@ static void *server_thread_fn(void *arg) {
                     }
                     pthread_mutex_unlock(&maps_mutex);
                 } else {
-                    /* try mapping by source address */
+                    /* try mapping by source address (IP only since device sends from varying source ports) */
                     pthread_mutex_lock(&maps_mutex);
                     int byaddr = -1;
-                    for (int i = 0; i < maps_count; ++i) if (maps[i].addr.sin_addr.s_addr == src.sin_addr.s_addr && maps[i].addr.sin_port == src.sin_port) { byaddr = i; break; }
+                    for (int i = 0; i < maps_count; ++i) if (maps[i].addr.sin_addr.s_addr == src.sin_addr.s_addr) { byaddr = i; break; }
                     if (byaddr >= 0) add_log_to_entry(byaddr, buf);
                     pthread_mutex_unlock(&maps_mutex);
                 }
