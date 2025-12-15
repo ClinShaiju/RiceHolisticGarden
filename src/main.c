@@ -26,6 +26,7 @@
 #include "lvgl/lvgl.h"
 // #include "lvgl/demos/lv_demos.h"
 #include "src/moisture.h"
+#include "src/server.h"
 
 #include "src/lib/driver_backends.h"
 #include "src/lib/simulator_util.h"
@@ -154,6 +155,11 @@ int main(int argc, char **argv)
     // lv_demo_widgets();
     // LV_LOG_INFO("Pixel before scaling R=%d G=%d B=%d", 1, 2, 3);
     // lv_demo_widgets_start_slideshow();
+    /* Start background UDP server to receive sensor updates from Arduinos */
+    if (server_start() != 0) {
+        fprintf(stderr, "Warning: failed to start sensor server\n");
+    }
+
     ui_moisture_dashboard_absolute();
 
 

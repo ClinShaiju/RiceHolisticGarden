@@ -3,6 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "src/flash.h"
+#include "src/moisture.h"
+#include <pthread.h>
 
 /* ---------------- Config ---------------- */
 
@@ -31,15 +34,21 @@
 #define BUTTON_SIZE 80
 #define BUTTON_MARGIN 20
 
-/* Persistence Config */
-#define SAVE_FILE_PATH "plots.bin"
+/* Persistence Config: store per-user file under $HOME for consistent restarts */
 #define SAVE_MAGIC 0x4D445031 /* 'MDP1' */
+
+static void get_save_file_path(char *out, size_t out_len) {
+    const char *home = getenv("HOME");
+    if (!home || home[0] == '\0') home = "/tmp";
+    /* Use a dot-file in home to persist across cwd changes */
+    snprintf(out, out_len, "%s/.riceholistic_plots.bin", home);
+}
 
 /* ---------------- Data Model ---------------- */
 
 typedef struct {
     char name[32];
-    int32_t sensor_id;
+    char sensor_mac[32];
     int32_t threshold;
     int32_t moisture;
     int32_t sim_target;
@@ -129,7 +138,9 @@ static void init_gradients(void) {
 /* ---------------- Persistence ---------------- */
 
 static void save_plots_to_disk(void) {
-    FILE* f = fopen(SAVE_FILE_PATH, "wb");
+    char path[512];
+    get_save_file_path(path, sizeof(path));
+    FILE* f = fopen(path, "wb");
     if (!f) return;
 
     plots_file_t disk;
@@ -148,7 +159,9 @@ static void save_plots_to_disk(void) {
 }
 
 static bool load_plots_from_disk(void) {
-    FILE* f = fopen(SAVE_FILE_PATH, "rb");
+    char path[512];
+    get_save_file_path(path, sizeof(path));
+    FILE* f = fopen(path, "rb");
     if (!f) return false;
 
     plots_file_t disk;
@@ -171,7 +184,7 @@ static bool load_plots_from_disk(void) {
 
 /* ---------------- Helpers ---------------- */
 
-static void add_new_plot(void) {
+static void add_new_plot(const char *sensor_mac) {
     if (plot_count >= MAX_PLOTS) return;
 
     int id = plot_count;
@@ -179,7 +192,12 @@ static void add_new_plot(void) {
 
     plot_name_counter++;
     snprintf(p->name, sizeof(p->name), "Plot #%d", plot_name_counter);
-    p->sensor_id = id + 100;
+    if (sensor_mac && sensor_mac[0]) {
+        strncpy(p->sensor_mac, sensor_mac, sizeof(p->sensor_mac)-1);
+        p->sensor_mac[sizeof(p->sensor_mac)-1] = '\0';
+    } else {
+        snprintf(p->sensor_mac, sizeof(p->sensor_mac), "AUTO%03d", id+100);
+    }
     p->threshold = 50;
     p->moisture = 50;
     p->sim_target = 50;
@@ -187,6 +205,28 @@ static void add_new_plot(void) {
 
     plot_count++;
 }
+
+/* Public API: add a new plot bound to a sensor MAC string */
+static void refresh_dashboard(void); /* forward declaration so callers above can use it */
+int moisture_add_plot_for_sensor(const char *sensor_mac) {
+    if (plot_count >= MAX_PLOTS) return -1;
+
+    /* Reuse existing add_new_plot to keep initialization consistent */
+    add_new_plot(sensor_mac);
+    int id = plot_count - 1;
+    if (id < 0) return -1;
+
+    save_plots_to_disk();
+    /* refresh_dashboard is defined later; forward-declared below to ensure
+     * use here does not trigger implicit-declaration warnings. */
+    refresh_dashboard();
+    return id;
+}
+
+/* The old direct-update API has been removed. Use
+ * `moisture_receive_sensor_value()` which stores the last-received data and
+ * lets the LVGL timer apply it to the UI.
+ */
 
 static lv_coord_t get_slot_x(int index) {
     return START_X + (index * SLOT_SPACING);
@@ -250,10 +290,10 @@ static void fill_slot_with_data(slot_handles_t* h, const plot_data_t* data) {
         lv_obj_add_flag(h->slider, LV_OBJ_FLAG_HIDDEN);
     }
 
-    int32_t val = data->moisture;
+    int val = data->moisture;
     if (val < 0) val = 0; if (val > 100) val = 100;
 
-    int32_t cover_percent = 100 - val;
+    int cover_percent = 100 - val;
     if (cover_percent > 0) {
         lv_obj_set_height(h->cover, LV_PCT(cover_percent));
         lv_obj_clear_flag(h->cover, LV_OBJ_FLAG_HIDDEN);
@@ -338,7 +378,7 @@ static void reset_confirm_event_cb(lv_event_t* e) {
         plot_name_counter = 0;
         scroll_offset = 0;
         /* Re-create Defaults */
-        add_new_plot(); add_new_plot(); add_new_plot(); add_new_plot();
+        add_new_plot(NULL); add_new_plot(NULL); add_new_plot(NULL); add_new_plot(NULL);
         all_plots[0].threshold = 80; all_plots[0].moisture = 50;
         all_plots[0].sim_target = 50; all_plots[0].sim_step = 0;
         all_plots[1].threshold = 20; all_plots[1].moisture = 80;
@@ -531,6 +571,99 @@ static void create_delete_popup(int data_idx)
     lv_obj_add_event_cb(btn_no, delete_confirm_event_cb, LV_EVENT_CLICKED, mbox);
 }
 
+/* ---------------- Flash (Add) Confirmation Popup ---------------- */
+
+static void flash_confirm_event_cb(lv_event_t* e) {
+    lv_obj_t* btn = lv_event_get_target(e);
+    lv_obj_t* mbox_ref = (lv_obj_t*)lv_event_get_user_data(e);
+    lv_obj_t* label = lv_obj_get_child(btn, 0);
+    const char* txt = lv_label_get_text(label);
+
+    if (txt && strcmp(txt, "Yes") == 0) {
+        /* Immediate status so we know the callback fired */
+        moisture_flash_status_update("User confirmed flash: starting...");
+        /* Start flashing in background; UI shows further status via moisture_flash_status_update */
+        int rc = flash_flash_first_device_and_register();
+        if (rc != 0) {
+            moisture_flash_status_update("Failed to start flash thread");
+        }
+    }
+    lv_msgbox_close(mbox_ref);
+}
+
+static void create_flash_popup(void)
+{
+    lv_obj_t* mbox = lv_msgbox_create(NULL);
+    lv_obj_set_size(mbox, 520, 260);
+    lv_obj_center(mbox);
+
+    lv_obj_set_style_bg_color(mbox, lv_color_hex(0x2B2B2B), 0);
+    lv_obj_set_style_bg_opa(mbox, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(mbox, 16, 0);
+    lv_obj_set_style_border_width(mbox, 0, 0);
+    lv_obj_set_style_shadow_width(mbox, 40, 0);
+
+    /* CONTENT (title + text) */
+    lv_obj_t* content = lv_msgbox_get_content(mbox);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content,
+        LV_FLEX_ALIGN_START,    /* vertical: top-down   */
+        LV_FLEX_ALIGN_START,    /* horizontal: left     */
+        LV_FLEX_ALIGN_START);
+
+    lv_obj_set_style_pad_top(content, 24, 0);
+    lv_obj_set_style_pad_bottom(content, 24, 0);
+    lv_obj_set_style_pad_left(content, 32, 0);
+    lv_obj_set_style_pad_right(content, 32, 0);
+    lv_obj_set_style_pad_row(content, 8, 0);
+
+    lv_obj_t* title_lbl = lv_label_create(content);
+    lv_label_set_text(title_lbl, "Flash Arduino");
+    lv_obj_set_style_text_color(title_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(title_lbl, &lv_font_montserrat_20, 0);
+
+    lv_obj_t* txt = lv_label_create(content);
+    lv_label_set_text(txt, "Attach an Arduino (Nano 33 IoT) to the Pi via USB and press Yes to flash and register it.");
+    lv_obj_set_style_text_font(txt, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(txt, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_align(txt, LV_TEXT_ALIGN_LEFT, 0);
+
+    /* FOOTER BUTTONS (msgbox built‑in row at bottom) */
+    lv_obj_t* btn_yes = lv_msgbox_add_footer_button(mbox, "Yes");
+    lv_obj_t* btn_no = lv_msgbox_add_footer_button(mbox, "No");
+
+    /* make the footer row fill width with side/bottom margins */
+    lv_obj_t* footer = lv_obj_get_parent(btn_yes);
+    lv_obj_set_size(footer, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_left(footer, 32, 0);
+    lv_obj_set_style_pad_right(footer, 32, 0);
+    lv_obj_set_style_pad_top(footer, 12, 0);
+    lv_obj_set_style_pad_bottom(footer, 16, 0);
+    lv_obj_set_style_pad_column(footer, 16, 0);
+    lv_obj_set_flex_flow(footer, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(footer,
+        LV_FLEX_ALIGN_END,      /* buttons right‑aligned */
+        LV_FLEX_ALIGN_CENTER,
+        LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_set_height(btn_yes, 56);
+    lv_obj_set_style_pad_left(btn_yes, 28, 0);
+    lv_obj_set_style_pad_right(btn_yes, 28, 0);
+    lv_obj_set_style_radius(btn_yes, 10, 0);
+    lv_obj_set_style_bg_color(btn_yes, lv_color_hex(0x00AA00), 0);
+    lv_obj_set_style_text_color(btn_yes, lv_color_white(), 0);
+
+    lv_obj_set_height(btn_no, 56);
+    lv_obj_set_style_pad_left(btn_no, 28, 0);
+    lv_obj_set_style_pad_right(btn_no, 28, 0);
+    lv_obj_set_style_radius(btn_no, 10, 0);
+    lv_obj_set_style_bg_color(btn_no, lv_color_hex(0x555555), 0);
+    lv_obj_set_style_text_color(btn_no, lv_color_white(), 0);
+
+    lv_obj_add_event_cb(btn_yes, flash_confirm_event_cb, LV_EVENT_CLICKED, mbox);
+    lv_obj_add_event_cb(btn_no, flash_confirm_event_cb, LV_EVENT_CLICKED, mbox);
+}
+
 
 
 
@@ -717,9 +850,11 @@ static void rename_button_event_cb(lv_event_t* e) {
 
 static void add_button_event_cb(lv_event_t* e) {
     if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
-        add_new_plot();
-        refresh_dashboard();
-        save_plots_to_disk();
+        /* Show a confirmation popup instructing the user to attach an
+         * Arduino. Pressing Yes will start the asynchronous flash/registration
+         * flow provided by `flash_flash_first_device_and_register()`.
+         */
+        create_flash_popup();
     }
 }
 
@@ -864,20 +999,160 @@ static void scroll_right_btn_cb(lv_event_t* e) {
     }
 }
 
-static void sensor_simulation_timer_cb(lv_timer_t* timer) {
-    (void)timer;
-    for (int i = 0; i < plot_count; i++) {
-        plot_data_t* p = &all_plots[i];
-        if (p->moisture == p->sim_target) {
-            p->sim_target = rand() % 101;
-            p->sim_step = (p->sim_target > p->moisture) ? 1 : -1;
-        }
+/* We keep a small thread-safe buffer of last-received sensor values. The
+ * network/server code calls `moisture_receive_sensor_values()` with a batch
+ * of readings; LVGL runs a timer that applies these last-received values to
+ * the visible plots so the display is always driven by LVGL.
+ */
+static pthread_mutex_t last_recv_mutex = PTHREAD_MUTEX_INITIALIZER;
+typedef struct {
+    char mac[32];
+    float filtered; /* EMA-filtered percent value (0..100) */
+    int updated;
+} last_recv_entry_t;
+static last_recv_entry_t last_recv[MAX_PLOTS];
+static int last_recv_count = 0;
 
-        if (p->moisture != p->sim_target) {
-            p->moisture += p->sim_step;
+/* Flash status UI support (updated asynchronously by flash.c) */
+static pthread_mutex_t flash_status_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char flash_status_buf[256] = {0};
+static lv_obj_t* flash_status_label = NULL; /* created during UI init */
+
+static void flash_status_async_cb(lv_timer_t* timer) {
+    (void)timer;
+    /* Runs on LVGL thread */
+    pthread_mutex_lock(&flash_status_mutex);
+    if (!flash_status_label) {
+        pthread_mutex_unlock(&flash_status_mutex);
+        return;
+    }
+    if (flash_status_buf[0]) {
+        lv_label_set_text(flash_status_label, flash_status_buf);
+        lv_obj_clear_flag(flash_status_label, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_label_set_text(flash_status_label, "");
+        lv_obj_add_flag(flash_status_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    pthread_mutex_unlock(&flash_status_mutex);
+}
+
+void moisture_flash_status_update(const char *status) {
+    pthread_mutex_lock(&flash_status_mutex);
+    if (status && status[0]) {
+        /* copy and ensure null-termination */
+        strncpy(flash_status_buf, status, sizeof(flash_status_buf)-1);
+        flash_status_buf[sizeof(flash_status_buf)-1] = '\0';
+    } else {
+        flash_status_buf[0] = '\0';
+    }
+    pthread_mutex_unlock(&flash_status_mutex);
+    /* schedule update on LVGL thread */
+    /* Also write a small log so users can `tail -f /tmp/flash.log` to see progress */
+    if (status && status[0]) {
+        FILE *lf = fopen("/tmp/flash.log", "a");
+        if (lf) {
+            fprintf(lf, "%s\n", status);
+            fclose(lf);
+        }
+        /* Echo to stderr as well for easy terminal visibility */
+        fprintf(stderr, "FLASH: %s\n", status);
+    }
+    /* Do not call lv_async_call here; the UI polls flash_status_buf via
+     * a periodic timer created during UI init. This avoids cross-thread
+     * LVGL calls which can be fragile in some builds. */
+}
+
+/* Smoothing alpha for EMA. Default chosen to be responsive but smooth. */
+static float smoothing_alpha = 0.2f;
+
+void moisture_set_smoothing_alpha(float alpha) {
+    if (alpha <= 0.0f) return; /* ignore non-positive */
+    if (alpha > 1.0f) alpha = 1.0f;
+    smoothing_alpha = alpha;
+}
+
+static int voltage_to_percent(float v) {
+    /* Convert 0..3.3V into inverted 100..0 percent. Values out of range
+     * are clamped to 0..3.3 before conversion. */
+    const float V_MAX = 3.3f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > V_MAX) v = V_MAX;
+    float pct = (1.0f - (v / V_MAX)) * 100.0f;
+    int ipct = (int)roundf(pct);
+    if (ipct < 0) ipct = 0;
+    if (ipct > 100) ipct = 100;
+    return ipct;
+}
+
+void moisture_receive_sensor_values(const sensor_reading_t *readings, size_t count) {
+    if (!readings || count == 0) return;
+    pthread_mutex_lock(&last_recv_mutex);
+    for (size_t r = 0; r < count; r++) {
+        const char *sensor_mac = readings[r].mac;
+        float voltage = readings[r].moisture;
+        int moisture = voltage_to_percent(voltage);
+        float newf = (float)moisture;
+        if (!sensor_mac || sensor_mac[0] == '\0') continue;
+
+        /* Update existing entry */
+        int found = 0;
+        for (int i = 0; i < last_recv_count; i++) {
+            if (strncmp(last_recv[i].mac, sensor_mac, sizeof(last_recv[i].mac)) == 0) {
+                /* Apply EMA: filtered = alpha * new + (1-alpha) * old */
+                last_recv[i].filtered = smoothing_alpha * newf + (1.0f - smoothing_alpha) * last_recv[i].filtered;
+                last_recv[i].updated = 1;
+                found = 1;
+                break;
+            }
+        }
+        if (!found && last_recv_count < MAX_PLOTS) {
+            strncpy(last_recv[last_recv_count].mac, sensor_mac, sizeof(last_recv[last_recv_count].mac)-1);
+            last_recv[last_recv_count].mac[sizeof(last_recv[last_recv_count].mac)-1] = '\0';
+            /* initialize filtered to first sample (no smoothing yet) */
+            last_recv[last_recv_count].filtered = newf;
+            last_recv[last_recv_count].updated = 1;
+            last_recv_count++;
         }
     }
-    if (!is_animating) refresh_dashboard();
+    pthread_mutex_unlock(&last_recv_mutex);
+}
+
+/* Use the batch API `moisture_receive_sensor_values()`; no single-item
+ * wrapper is provided to keep the interface explicit.
+ */
+
+static void moisture_apply_received_timer_cb(lv_timer_t* timer) {
+    (void)timer;
+    int changed = 0;
+    pthread_mutex_lock(&last_recv_mutex);
+    for (int j = 0; j < last_recv_count; j++) {
+        if (!last_recv[j].updated) continue;
+        const char *mac = last_recv[j].mac;
+        int moist = (int)roundf(last_recv[j].filtered);
+        /* find plot */
+        int found = 0;
+        for (int i = 0; i < plot_count; i++) {
+            if (strncmp(all_plots[i].sensor_mac, mac, sizeof(all_plots[i].sensor_mac)) == 0) {
+                all_plots[i].moisture = moist;
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            int idx = moisture_add_plot_for_sensor(mac);
+            if (idx >= 0) {
+                all_plots[idx].moisture = moist;
+            }
+        }
+        last_recv[j].updated = 0;
+        changed = 1;
+    }
+    pthread_mutex_unlock(&last_recv_mutex);
+
+    if (changed && !is_animating) {
+        refresh_dashboard();
+        save_plots_to_disk();
+    }
 }
 
 /* ---------------- UI Construction ---------------- */
@@ -993,6 +1268,25 @@ void ui_moisture_dashboard_absolute(void) {
     lv_obj_set_style_text_color(title, lv_color_hex(0xA6A6A6), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
 
+    /* Flashing status label (updated asynchronously by flash module) */
+    flash_status_label = lv_label_create(scr);
+    lv_label_set_text(flash_status_label, "");
+    lv_obj_set_style_text_color(flash_status_label, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_style_text_font(flash_status_label, &lv_font_montserrat_20, 0);
+    lv_obj_align(flash_status_label, LV_ALIGN_TOP_MID, 0, 50);
+    lv_obj_add_flag(flash_status_label, LV_OBJ_FLAG_HIDDEN);
+    /* Ensure status label is above other elements so it's visible */
+    lv_obj_move_foreground(flash_status_label);
+    /* Create a periodic LVGL timer to pull status updates from the
+     * flash_status_buf written by the flash thread. Using a timer avoids
+     * calling LVGL async helpers from arbitrary threads which may be
+     * unsupported in some deployments. */
+    lv_timer_t *flash_timer = lv_timer_create_basic();
+    if (flash_timer) {
+        lv_timer_set_period(flash_timer, 200);
+        lv_timer_set_cb(flash_timer, flash_status_async_cb);
+    }
+
     /* Load from Disk OR Create Defaults */
     bool loaded = load_plots_from_disk();
 
@@ -1093,7 +1387,7 @@ void ui_moisture_dashboard_absolute(void) {
     lv_obj_center(btn_edit_label);
 
     if (!loaded) {
-        add_new_plot(); add_new_plot(); add_new_plot(); add_new_plot();
+        add_new_plot(NULL); add_new_plot(NULL); add_new_plot(NULL); add_new_plot(NULL);
         all_plots[0].threshold = 80; all_plots[0].moisture = 50;
         all_plots[1].threshold = 20; all_plots[1].moisture = 80;
         all_plots[2].threshold = 95; all_plots[2].moisture = 100;
@@ -1102,5 +1396,9 @@ void ui_moisture_dashboard_absolute(void) {
     }
 
     refresh_dashboard();
-    lv_timer_create(sensor_simulation_timer_cb, 50, NULL);
+    /* Create LVGL timer that applies last-received external values to the UI.
+     * This replaces the old simulation timer so the UI is driven only by
+     * data from attached devices.
+     */
+    lv_timer_create(moisture_apply_received_timer_cb, 200, NULL);
 }
