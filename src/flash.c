@@ -111,7 +111,7 @@ static void *flash_thread_fn(void *arg)
     moisture_flash_status_update("Searching for serial device...");
     char devpath[256] = {0}; if (find_first_serial(devpath, sizeof(devpath)) != 0) { moisture_flash_status_update("No serial device found"); moisture_add_plot_for_sensor(NULL); return NULL; }
 
-    const char *env_ssid = getenv("FLASH_SSID"); const char *env_pass = getenv("FLASH_PASS"); const char *env_target = getenv("FLASH_TARGET_IP");
+    const char *env_ssid = getenv("FLASH_SSID"); const char *env_pass = getenv("FLASH_PASS"); const char *env_target = getenv("FLASH_TARGET_IP"); const char *env_ctrl = getenv("FLASH_CONTROL_PIN");
     char use_path[512]; strncpy(use_path, FIRMWARE_PATH, sizeof(use_path)); use_path[sizeof(use_path)-1] = '\0'; int created_tmp = 0; char tmpdir[512];
     if (env_ssid || env_pass || env_target) {
         snprintf(tmpdir, sizeof(tmpdir), "/tmp/plant_sensor_%d", (int)getpid()); mkdir(tmpdir, 0755);
@@ -119,15 +119,54 @@ static void *flash_thread_fn(void *arg)
         FILE *fr = fopen(src, "rb"); if (fr) {
             FILE *fw = fopen(dst, "wb"); if (fw) { char dbuf[4096]; size_t n; while ((n = fread(dbuf,1,sizeof(dbuf),fr))>0) fwrite(dbuf,1,n,fw); fclose(fw); }
             fclose(fr);
-            snprintf(dst, sizeof(dst), "%s/config.h", tmpdir); FILE *fc = fopen(dst, "wb"); if (fc) { if (env_ssid) fprintf(fc, "#define WIFI_SSID \"%s\"\n", env_ssid); if (env_pass) fprintf(fc, "#define WIFI_PASS \"%s\"\n", env_pass); if (env_target) fprintf(fc, "#define TARGET_IP \"%s\"\n", env_target); fclose(fc); strncpy(use_path, tmpdir, sizeof(use_path)); created_tmp = 1; }
+            snprintf(dst, sizeof(dst), "%s/config.h", tmpdir);
+            FILE *fc = fopen(dst, "wb");
+            if (fc) {
+                if (env_ssid) fprintf(fc, "#define WIFI_SSID \"%s\"\n", env_ssid);
+                if (env_pass) fprintf(fc, "#define WIFI_PASS \"%s\"\n", env_pass);
+                if (env_target) fprintf(fc, "#define TARGET_IP \"%s\"\n", env_target);
+                /* Ensure control pin default is D2 unless overridden */
+                if (env_ctrl) fprintf(fc, "#define CONTROL_PIN %s\n", env_ctrl);
+                else fprintf(fc, "#define CONTROL_PIN 2\n");
+                fclose(fc);
+                strncpy(use_path, tmpdir, sizeof(use_path)); created_tmp = 1;
+            }
         }
     }
 
     const char *arduino_cli = NULL; if (access("/usr/local/bin/arduino-cli", X_OK) == 0) arduino_cli = "/usr/local/bin/arduino-cli"; else if (access("/usr/bin/arduino-cli", X_OK) == 0) arduino_cli = "/usr/bin/arduino-cli";
     if (arduino_cli) {
         const char *fqbn = getenv(FQBN_ENV_VAR); if (!fqbn) fqbn = DEFAULT_FQBN;
-        char cmd[2048]; snprintf(cmd, sizeof(cmd), "%s upload -p %s --fqbn %s %s 2>&1", arduino_cli, devpath, fqbn, use_path);
-        moisture_flash_status_update("Flashing device..."); FILE *p = popen(cmd, "r"); if (p) { char line[512]; while (fgets(line, sizeof(line), p)) moisture_flash_status_update(line); pclose(p); } else moisture_flash_status_update("Failed to run arduino-cli");
+
+        char compile_cmd[2048];
+        snprintf(compile_cmd, sizeof(compile_cmd), "%s compile --fqbn %s %s 2>&1", arduino_cli, fqbn, use_path);
+        moisture_flash_status_update("Compiling sketch...");
+        FILE *pc = popen(compile_cmd, "r");
+        int compile_ok = 0;
+        if (pc) {
+            char line[512];
+            while (fgets(line, sizeof(line), pc)) moisture_flash_status_update(line);
+            int rc = pclose(pc);
+            if (rc == 0) compile_ok = 1;
+            else {
+                char eb[128]; snprintf(eb, sizeof(eb), "Compile failed (rc=%d)", rc); moisture_flash_status_update(eb);
+            }
+        } else {
+            moisture_flash_status_update("Failed to run arduino-cli compile");
+        }
+
+        if (compile_ok) {
+            char cmd[2048];
+            snprintf(cmd, sizeof(cmd), "%s upload -p %s --fqbn %s %s 2>&1", arduino_cli, devpath, fqbn, use_path);
+            moisture_flash_status_update("Flashing device...");
+            FILE *p = popen(cmd, "r");
+            if (p) {
+                char line[512]; while (fgets(line, sizeof(line), p)) moisture_flash_status_update(line);
+                pclose(p);
+            } else moisture_flash_status_update("Failed to run arduino-cli upload");
+        } else {
+            moisture_flash_status_update("Skipping upload due to compile errors");
+        }
     } else { moisture_flash_status_update("arduino-cli not found; skipping flash"); }
 
     char newpath[256] = {0}; if (find_first_serial(newpath, sizeof(newpath)) == 0) {

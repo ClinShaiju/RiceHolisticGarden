@@ -3,8 +3,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <strings.h>
 #include "src/flash.h"
 #include "src/moisture.h"
+#include "src/server.h"
 #include <pthread.h>
 
 /* ---------------- Config ---------------- */
@@ -54,6 +56,9 @@ typedef struct {
     int32_t sim_target;
     int32_t sim_step;
 } plot_data_t;
+
+/* Runtime-only per-plot output state for D0 (not persisted) */
+static int plot_output_state[MAX_PLOTS];
 
 /* File Header Structure for Save/Load */
 typedef struct {
@@ -202,14 +207,103 @@ static void add_new_plot(const char *sensor_mac) {
     p->moisture = 50;
     p->sim_target = 50;
     p->sim_step = 0;
+    /* default output state = off */
+    plot_output_state[id] = 0;
 
     plot_count++;
 }
 
+/* Pending command queue for retries when a device hasn't been seen yet */
+#define PENDING_CMD_MAX 32
+#define PENDING_CMD_MAX_ATTEMPTS 12
+typedef struct {
+    char mac[32];
+    char text[128];
+    int attempts;
+} pending_cmd_t;
+
+static pending_cmd_t pending_cmds[PENDING_CMD_MAX];
+static int pending_cmds_count = 0;
+
+/* Try to send text to device now; if it fails (no mapping), enqueue for retry. */
+static int send_or_enqueue_text(const char *mac, const char *text) {
+    if (!mac || !text) return -1;
+    if (server_send_text_to_mac(mac, text) == 0) return 0;
+
+    /* enqueue if not already present */
+    for (int i = 0; i < pending_cmds_count; ++i) {
+        if (strcmp(pending_cmds[i].mac, mac) == 0 && strcmp(pending_cmds[i].text, text) == 0) {
+            /* already pending, bump attempts to allow more retries */
+            pending_cmds[i].attempts = 0;
+            return -1;
+        }
+    }
+    if (pending_cmds_count < PENDING_CMD_MAX) {
+        strncpy(pending_cmds[pending_cmds_count].mac, mac, sizeof(pending_cmds[pending_cmds_count].mac)-1);
+        pending_cmds[pending_cmds_count].mac[sizeof(pending_cmds[pending_cmds_count].mac)-1] = '\0';
+        strncpy(pending_cmds[pending_cmds_count].text, text, sizeof(pending_cmds[pending_cmds_count].text)-1);
+        pending_cmds[pending_cmds_count].text[sizeof(pending_cmds[pending_cmds_count].text)-1] = '\0';
+        pending_cmds[pending_cmds_count].attempts = 0;
+        pending_cmds_count++;
+        return -1;
+    }
+    /* queue full: overwrite oldest */
+    int idx = 0;
+    for (int i = 1; i < pending_cmds_count; ++i) {
+        if (pending_cmds[i].attempts > pending_cmds[idx].attempts) idx = i;
+    }
+    strncpy(pending_cmds[idx].mac, mac, sizeof(pending_cmds[idx].mac)-1);
+    pending_cmds[idx].mac[sizeof(pending_cmds[idx].mac)-1] = '\0';
+    strncpy(pending_cmds[idx].text, text, sizeof(pending_cmds[idx].text)-1);
+    pending_cmds[idx].text[sizeof(pending_cmds[idx].text)-1] = '\0';
+    pending_cmds[idx].attempts = 0;
+    return -1;
+}
+
+static void moisture_retry_pending_timer_cb(lv_timer_t *t) {
+    (void)t;
+    if (pending_cmds_count == 0) return;
+    for (int i = 0; i < pending_cmds_count; ) {
+        if (server_send_text_to_mac(pending_cmds[i].mac, pending_cmds[i].text) == 0) {
+            /* sent, remove entry by shifting tail */
+            for (int j = i; j < pending_cmds_count - 1; ++j) pending_cmds[j] = pending_cmds[j+1];
+            pending_cmds_count--;
+            continue; /* don't increment i, new item at i */
+        } else {
+            pending_cmds[i].attempts++;
+            if (pending_cmds[i].attempts >= PENDING_CMD_MAX_ATTEMPTS) {
+                char eb[128]; snprintf(eb, sizeof(eb), "Timeout sending to %s: '%s'", pending_cmds[i].mac, pending_cmds[i].text); moisture_flash_status_update(eb);
+                /* drop it */
+                for (int j = i; j < pending_cmds_count - 1; ++j) pending_cmds[j] = pending_cmds[j+1];
+                pending_cmds_count--;
+                continue;
+            }
+        }
+        ++i;
+    }
+}
+
 /* Public API: add a new plot bound to a sensor MAC string */
 static void refresh_dashboard(void); /* forward declaration so callers above can use it */
+/* Forward declarations for debug-popup helpers added below */
+static void create_debug_popup(int data_idx);
+static void debug_msgbox_ok_cb(lv_event_t* e);
+static void debug_overlay_close_cb(lv_event_t* e);
 int moisture_add_plot_for_sensor(const char *sensor_mac) {
     if (plot_count >= MAX_PLOTS) return -1;
+
+    /* If a sensor_mac is provided, avoid creating duplicate plots for the
+     * same hardware. Return the existing index if already registered. */
+    if (sensor_mac && sensor_mac[0] != '\0') {
+        for (int i = 0; i < plot_count; ++i) {
+            if (all_plots[i].sensor_mac[0] == '\0') continue;
+            if (strcasecmp(all_plots[i].sensor_mac, sensor_mac) == 0) {
+                /* Already registered — refresh UI in case anything changed */
+                refresh_dashboard();
+                return i;
+            }
+        }
+    }
 
     /* Reuse existing add_new_plot to keep initialization consistent */
     add_new_plot(sensor_mac);
@@ -220,6 +314,16 @@ int moisture_add_plot_for_sensor(const char *sensor_mac) {
     /* refresh_dashboard is defined later; forward-declared below to ensure
      * use here does not trigger implicit-declaration warnings. */
     refresh_dashboard();
+    /* If this plot was bound to a real sensor MAC, push the current threshold
+     * value down to the device so it knows the configured threshold.
+     */
+    if (sensor_mac && sensor_mac[0] != '\0') {
+        int idx = plot_count - 1;
+        if (idx >= 0 && idx < MAX_PLOTS) {
+            char tmsg[64]; snprintf(tmsg, sizeof(tmsg), "THRESHOLD %d", all_plots[idx].threshold);
+            send_or_enqueue_text(all_plots[idx].sensor_mac, tmsg);
+        }
+    }
     return id;
 }
 
@@ -624,7 +728,10 @@ static void create_flash_popup(void)
 
     lv_obj_t* txt = lv_label_create(content);
     lv_label_set_text(txt, "Attach an Arduino (Nano 33 IoT) to the Pi via USB and press Yes to flash and register it.");
-    lv_obj_set_style_text_font(txt, &lv_font_montserrat_20, 0);
+    /* Limit width and enable wrapping so the popup doesn't require a vertical scrollbar */
+    lv_obj_set_width(txt, 456);
+    lv_label_set_long_mode(txt, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_style_text_font(txt, &lv_font_montserrat_18, 0);
     lv_obj_set_style_text_color(txt, lv_color_hex(0xCCCCCC), 0);
     lv_obj_set_style_text_align(txt, LV_TEXT_ALIGN_LEFT, 0);
 
@@ -724,6 +831,37 @@ static void create_rename_popup(int data_idx) {
     lv_obj_send_event(rename_ta, LV_EVENT_FOCUSED, NULL);
 }
 
+static void debug_msgbox_ok_cb(lv_event_t* e) {
+    lv_obj_t* mbox = (lv_obj_t*)lv_event_get_user_data(e);
+    if (mbox) lv_msgbox_close(mbox);
+}
+
+typedef struct {
+    lv_obj_t *overlay;
+    lv_obj_t *ta;
+    char mac[32];
+    lv_timer_t *tmr;
+} debug_ctx_t;
+
+static void debug_refresh_cb(lv_timer_t *t) {
+    debug_ctx_t *ctx = (debug_ctx_t*)lv_timer_get_user_data(t);
+    if (!ctx || !ctx->ta) return;
+    char *buf = malloc(8192);
+    if (!buf) return;
+    int rc = server_get_live_text_for_mac(ctx->mac, buf, 8192);
+    if (rc > 0 && buf[0]) lv_textarea_set_text(ctx->ta, buf);
+    else lv_textarea_set_text(ctx->ta, "<no live output>");
+    free(buf);
+}
+
+static void debug_overlay_close_cb(lv_event_t* e) {
+    debug_ctx_t *ctx = (debug_ctx_t*)lv_event_get_user_data(e);
+    if (!ctx) return;
+    if (ctx->tmr) lv_timer_del(ctx->tmr);
+    if (ctx->overlay) lv_obj_del(ctx->overlay);
+    free(ctx);
+}
+
 /* ---------------- Event Handlers ---------------- */
 
 static void toggle_delete_mode(void) {
@@ -759,8 +897,6 @@ static void toggle_rename_mode(void) {
 }
 
 static void slot_click_event_cb(lv_event_t* e) {
-    if (!delete_mode && !rename_mode) return;
-
     lv_obj_t* target = lv_event_get_target(e);
     int slot_idx = -1;
 
@@ -777,6 +913,79 @@ static void slot_click_event_cb(lv_event_t* e) {
 
     if (delete_mode) create_delete_popup(data_idx);
     else if (rename_mode) create_rename_popup(data_idx);
+    else if (!edit_mode) create_debug_popup(data_idx);
+}
+
+/* Show debug output popup for a plot's sensor (non-modal overlay) */
+static void create_debug_popup(int data_idx) {
+    if (data_idx < 0 || data_idx >= plot_count) return;
+    const char *mac = all_plots[data_idx].sensor_mac;
+    if (!mac || mac[0] == '\0') {
+        /* no device bound */
+        lv_obj_t* m = lv_msgbox_create(NULL);
+        lv_obj_set_size(m, 480, 200);
+        lv_obj_center(m);
+        lv_obj_t* content = lv_msgbox_get_content(m);
+        lv_obj_t* lbl = lv_label_create(content);
+        lv_label_set_text(lbl, "No device bound to this plot");
+        lv_obj_t* btn = lv_msgbox_add_footer_button(m, "OK");
+        lv_obj_add_event_cb(btn, debug_msgbox_ok_cb, LV_EVENT_CLICKED, m);
+        return;
+    }
+
+    /* Create a centered modal (same visual style as other popups) */
+    lv_obj_t* mbox = lv_obj_create(lv_screen_active());
+    lv_obj_set_size(mbox, 520, 380);
+    lv_obj_center(mbox);
+    lv_obj_set_style_bg_color(mbox, lv_color_hex(0x2B2B2B), 0);
+    lv_obj_set_style_bg_opa(mbox, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(mbox, 16, 0);
+    lv_obj_set_style_border_width(mbox, 0, 0);
+    lv_obj_set_style_shadow_width(mbox, 40, 0);
+
+    lv_obj_t* content = mbox; /* use mbox as container */
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_top(content, 12, 0);
+    lv_obj_set_style_pad_bottom(content, 12, 0);
+    lv_obj_set_style_pad_left(content, 12, 0);
+    lv_obj_set_style_pad_right(content, 12, 0);
+
+    lv_obj_t* ta = lv_textarea_create(content);
+    lv_obj_set_size(ta, 496, 300);
+    lv_obj_align(ta, LV_ALIGN_TOP_MID, 0, 16);
+    lv_obj_set_style_text_font(ta, &lv_font_montserrat_18, 0);
+    /* Make text area black with white text to match a console-like view */
+    lv_obj_set_style_bg_color(ta, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(ta, lv_color_white(), 0);
+    lv_textarea_set_text(ta, "<loading...>");
+
+    lv_obj_t* close_btn = lv_btn_create(content);
+    lv_obj_set_size(close_btn, 140, 44);
+    lv_obj_align(close_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_radius(close_btn, 10, 0);
+    lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x555555), 0);
+    lv_obj_set_style_text_color(close_btn, lv_color_white(), 0);
+    lv_obj_t* lbl = lv_label_create(close_btn);
+    lv_label_set_text(lbl, "Close");
+
+    /* Create context for periodic refresh */
+    debug_ctx_t *ctx = malloc(sizeof(debug_ctx_t));
+    if (!ctx) {
+        lv_obj_del(mbox);
+        return;
+    }
+    memset(ctx,0,sizeof(*ctx));
+    ctx->overlay = mbox;
+    ctx->ta = ta;
+    strncpy(ctx->mac, mac, sizeof(ctx->mac)-1);
+    ctx->mac[sizeof(ctx->mac)-1] = '\0';
+
+    /* Create timer to refresh live text every 500ms */
+    ctx->tmr = lv_timer_create(debug_refresh_cb, 500, ctx);
+    /* Attach close handler with ctx so it can clean up */
+    lv_obj_add_event_cb(close_btn, debug_overlay_close_cb, LV_EVENT_CLICKED, ctx);
 }
 
 static void slider_event_cb(lv_event_t* e) {
@@ -807,6 +1016,14 @@ static void slider_event_cb(lv_event_t* e) {
     all_plots[data_idx].threshold = lv_slider_get_value(slider);
     fill_slot_with_data(ui_slots[slot_idx], &all_plots[data_idx]);
     save_plots_to_disk();
+    /* Push threshold to device if it has a MAC */
+    if (all_plots[data_idx].sensor_mac[0] != '\0') {
+        char tmsg[64]; snprintf(tmsg, sizeof(tmsg), "THRESHOLD %d", all_plots[data_idx].threshold);
+        if (send_or_enqueue_text(all_plots[data_idx].sensor_mac, tmsg) != 0) {
+            /* Not fatal; device may not have been seen by server yet. Log to UI. */
+            char eb[128]; snprintf(eb, sizeof(eb), "Queued threshold for %s", all_plots[data_idx].sensor_mac); moisture_flash_status_update(eb);
+        }
+    }
 }
 
 static void edit_button_event_cb(lv_event_t* e) {
@@ -1144,6 +1361,25 @@ static void moisture_apply_received_timer_cb(lv_timer_t* timer) {
                 all_plots[idx].moisture = moist;
             }
         }
+        /* After updating moisture, decide whether to toggle D0 on the device. */
+        int plot_idx = -1;
+        for (int i = 0; i < plot_count; ++i) if (strncmp(all_plots[i].sensor_mac, mac, sizeof(all_plots[i].sensor_mac)) == 0) { plot_idx = i; break; }
+        if (plot_idx >= 0) {
+            /* If server knows device's output state, reflect it in UI */
+            int reported = server_get_output_state_for_mac(all_plots[plot_idx].sensor_mac);
+            if (reported == 0 || reported == 1) plot_output_state[plot_idx] = reported;
+
+            int desired = (all_plots[plot_idx].moisture < all_plots[plot_idx].threshold) ? 1 : 0;
+            if (desired != plot_output_state[plot_idx]) {
+                /* Try to send command to the device; ignore failure but log */
+                if (server_send_cmd_to_mac(all_plots[plot_idx].sensor_mac, desired) == 0) {
+                    plot_output_state[plot_idx] = desired;
+                } else {
+                    /* not fatal - device may not be known by server mapping yet */
+                    char eb[128]; snprintf(eb, sizeof(eb), "Failed to send D0=%d to %s", desired, all_plots[plot_idx].sensor_mac); moisture_flash_status_update(eb);
+                }
+            }
+        }
         last_recv[j].updated = 0;
         changed = 1;
     }
@@ -1401,4 +1637,7 @@ void ui_moisture_dashboard_absolute(void) {
      * data from attached devices.
      */
     lv_timer_create(moisture_apply_received_timer_cb, 200, NULL);
+    /* Timer to retry pending commands (threshold pushes) to devices that
+     * haven't been seen yet. Runs every 5 seconds. */
+    lv_timer_create(moisture_retry_pending_timer_cb, 5000, NULL);
 }

@@ -9,6 +9,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <ctype.h>
 
 #include "src/moisture.h"
 #include <fcntl.h>
@@ -130,7 +131,74 @@ static void *server_thread_fn(void *arg) {
             }
             /* Also stash into per-mac log buffer when possible. Try to
              * attribute the packet to a MAC. Many payloads start with the
-             * mac string; otherwise match by source address. */
+             * mac string; others are multi-line debug blocks that include
+             * a "MAC: aa:bb:..." line. Detect both forms. */
+            /* First, try to find an explicit "MAC: <mac>" line inside the payload. */
+            char mac_from_debug[64] = {0};
+            char *mp = strstr(buf, "MAC:");
+            if (mp) {
+                mp += 4; /* skip 'MAC:' */
+                while (*mp == ' ' || *mp == '\t') mp++;
+                int mi = 0;
+                while (*mp && *mp != '\n' && *mp != '\r' && !isspace((unsigned char)*mp) && mi < (int)sizeof(mac_from_debug)-1) {
+                    mac_from_debug[mi++] = *mp++;
+                }
+                mac_from_debug[mi] = '\0';
+            }
+
+            if (mac_from_debug[0]) {
+                /* Attribute this multi-line debug to the extracted MAC */
+                pthread_mutex_lock(&maps_mutex);
+                int found_idx = -1;
+                for (int i = 0; i < maps_count; ++i) if (strcasecmp(maps[i].mac, mac_from_debug) == 0) { found_idx = i; break; }
+                if (found_idx >= 0) {
+                    add_log_to_entry(found_idx, buf);
+                    /* parse control pin state from debug block */
+                    char statebuf[32] = {0};
+                    int pin = -1;
+                    if (sscanf(buf, "%*[^C]CONTROL_PIN (D%d) state: %31s", &pin, statebuf) == 2) {
+                        if (pin >= 0) {
+                            if (strcasecmp(statebuf, "HIGH") == 0) maps[found_idx].last_output_state = 1;
+                            else if (strcasecmp(statebuf, "LOW") == 0) maps[found_idx].last_output_state = 0;
+                        }
+                    } else {
+                        int pin2=-1, val=-1;
+                        if (sscanf(buf, "CMD: set D%d = %d", &pin2, &val) == 2 || sscanf(buf, "%s CMD D%d %d", statebuf, &pin2, &val) == 3) {
+                            if (pin2 >= 0 && val >= 0) maps[found_idx].last_output_state = (val ? 1 : 0);
+                        }
+                    }
+                } else {
+                    /* create a new mapping tied to source address */
+                    if (maps_count < SERVER_MAP_MAX) {
+                        strncpy(maps[maps_count].mac, mac_from_debug, sizeof(maps[maps_count].mac)-1);
+                        maps[maps_count].mac[sizeof(maps[maps_count].mac)-1] = '\0';
+                        maps[maps_count].addr = src;
+                        maps[maps_count].log_head = 0; maps[maps_count].log_count = 0; maps[maps_count].live_len = 0; maps[maps_count].live_text[0] = '\0';
+                        add_log_to_entry(maps_count, buf);
+                        maps[maps_count].last_output_state = -1;
+                        maps_count++;
+                    } else {
+                        /* fallback to attributing by source address */
+                        int byaddr = -1;
+                        for (int i = 0; i < maps_count; ++i) if (maps[i].addr.sin_addr.s_addr == src.sin_addr.s_addr && maps[i].addr.sin_port == src.sin_port) { byaddr = i; break; }
+                        if (byaddr >= 0) {
+                            add_log_to_entry(byaddr, buf);
+                            char statebuf[32] = {0}; int pin=-1;
+                            if (sscanf(buf, "%*[^C]CONTROL_PIN (D%d) state: %31s", &pin, statebuf) == 2) {
+                                if (pin >= 0) {
+                                    if (strcasecmp(statebuf, "HIGH") == 0) maps[byaddr].last_output_state = 1;
+                                    else if (strcasecmp(statebuf, "LOW") == 0) maps[byaddr].last_output_state = 0;
+                                }
+                            }
+                        }
+                    }
+                }
+                pthread_mutex_unlock(&maps_mutex);
+                /* we've handled this packet with mac attribution; continue to next recv */
+                continue;
+            }
+
+            /* If no embedded MAC line was found, fall back to existing first-token/source-addr heuristics */
             char firsttok[64] = {0};
             if (sscanf(buf, "%63s", firsttok) == 1) {
                 /* crude check for colon-separated MAC */
@@ -195,7 +263,6 @@ static void *server_thread_fn(void *arg) {
                     pthread_mutex_unlock(&maps_mutex);
                 }
             }
-        }
 
         /* Expect messages like: "SENSOR <mac> <moisture>", "<mac> <moisture>", or "aa:bb:... ,moist" */
         char mac[32] = {0};
@@ -394,3 +461,8 @@ void server_stop(void) {
     }
     pthread_join(server_thread, NULL);
 }
+
+}
+
+/* Extra closing brace to balance earlier blocks introduced during edits. */
+
