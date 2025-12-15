@@ -48,24 +48,24 @@ void setup() {
   // Unique banner to verify firmware version running on device
   Serial.println("PLANT_SENSOR_BIN:v2");
 
-  // Connect to WiFi
+  // Connect to WiFi (retry every 5 seconds indefinitely)
   int status = WL_IDLE_STATUS;
-  unsigned long start = millis();
   Serial.print("Connecting to "); Serial.println(ssid);
   int attempt = 0;
-  while (status != WL_CONNECTED && millis() - start < 20000) {
+  
+  while (status != WL_CONNECTED) {
     attempt++;
-    Serial.print("WiFi.begin attempt #"); Serial.println(attempt);
+    Serial.print("WiFi attempt #"); Serial.println(attempt);
     status = WiFi.begin(ssid, pass);
-    Serial.print("WiFi.status() -> "); Serial.println(status);
-    delay(1000);
-  }
-
-  if (status == WL_CONNECTED) {
-    IPAddress ip = WiFi.localIP();
-    Serial.print("Connected, IP: "); Serial.println(ip);
-  } else {
-    Serial.println("WiFi connect failed");
+    
+    if (status == WL_CONNECTED) {
+      IPAddress ip = WiFi.localIP();
+      Serial.print("Connected, IP: "); Serial.println(ip);
+      break;
+    } else {
+      Serial.print("WiFi.status() -> "); Serial.println(status);
+      delay(5000); // Retry every 5 seconds
+    }
   }
 
   // MAC
@@ -118,6 +118,55 @@ void udp_debug(const char *msg) {
 }
 
 void loop() {
+  // Check WiFi connection; mirror setup-style reconnect without scans/resets
+  static unsigned long last_wifi_check = 0;
+  static bool attempting_reconnect = false;
+  static unsigned long attempt_start = 0;
+  static uint32_t attempt_counter = 0;
+  if (WiFi.status() != WL_CONNECTED) {
+    // Start an attempt every 5 seconds if not already trying
+    if (!attempting_reconnect && millis() - last_wifi_check > 5000) {
+      last_wifi_check = millis();
+      attempting_reconnect = true;
+      attempt_start = millis();
+      attempt_counter++;
+      Serial.println("WiFi reconnect: begin");
+      // Stop UDP to avoid socket residue during rejoin
+      Udp.stop();
+      // On every attempt, fully end the WiFi stack before begin (mirrors cold boot)
+      WiFi.end();
+      delay(200);
+      // Also clear stored network info every second attempt to purge stale state
+      if (attempt_counter % 2 == 0) {
+        Serial.println("WiFi.disconnect(true) before begin");
+        WiFi.disconnect(true);
+        delay(200);
+      }
+      WiFi.begin(ssid, pass);
+    }
+    // Poll for up to 20s, like setup()
+    if (attempting_reconnect) {
+      if (WiFi.status() == WL_CONNECTED) {
+        attempting_reconnect = false;
+        IPAddress ip = WiFi.localIP();
+        Serial.print("Reconnected, IP: "); Serial.println(ip);
+        Udp.stop();
+        Udp.begin(localPort);
+        char onbuf[64];
+        int nn = snprintf(onbuf, sizeof(onbuf), "%s ONLINE", macStr);
+        Udp.beginPacket(targetIp, localPort);
+        Udp.write((const uint8_t*)onbuf, nn);
+        Udp.endPacket();
+      } else if (millis() - attempt_start > 20000) {
+        // Give up this attempt and will retry on next 5s tick
+        attempting_reconnect = false;
+        Serial.println("WiFi reconnect: attempt timed out");
+      }
+    }
+  } else {
+    attempting_reconnect = false;
+  }
+
   // Read analog value from A0 -> map to voltage (0..3.3V). Nano 33 ADC ref is 3.3V.
   int raw = analogRead(A0);
   const float ADC_MAX = 1023.0f;
@@ -156,9 +205,11 @@ void loop() {
   int v_frac = abs(milliv % 1000);
   snprintf(vbuf, sizeof(vbuf), "%d.%03d", v_int, v_frac);
   int n = snprintf(buf, sizeof(buf), "%s %s", macStr, vbuf);
-  Udp.beginPacket(targetIp, 12345);
-  Udp.write((const uint8_t*)buf, n);
-  Udp.endPacket();
+  if (WiFi.status() == WL_CONNECTED) {
+    Udp.beginPacket(targetIp, 12345);
+    Udp.write((const uint8_t*)buf, n);
+    Udp.endPacket();
+  }
 
   // Before building the debug block, ensure the control pin reflects the
   // configured threshold. If the automatic decision changes the pin state
@@ -193,7 +244,7 @@ void loop() {
     "=== LOOP END ===\n",
     millis(), macStr, raw, voltage, milliv, percent, buf, CONTROL_PIN, digitalRead(CONTROL_PIN) == HIGH ? "HIGH" : "LOW", stored_threshold);
   // Send debug over UDP
-  udp_debug(dbg);
+  if (WiFi.status() == WL_CONNECTED) udp_debug(dbg);
   // Also print locally to Serial for USB-attached debugging
   Serial.print(dbg);
   Serial.flush();
@@ -206,7 +257,7 @@ void loop() {
   delay(2000);
 
   // Non-blocking: check for incoming UDP control packets and act on them
-  int packetSize = Udp.parsePacket();
+  int packetSize = (WiFi.status() == WL_CONNECTED) ? Udp.parsePacket() : 0;
   if (packetSize > 0) {
     char cmdbuf[64];
     int len = Udp.read(cmdbuf, sizeof(cmdbuf) - 1);
@@ -239,4 +290,6 @@ void loop() {
       }
     }
   }
+
+  // No watchdog reboot: focus on reliable reconnect behavior like setup()
 }
