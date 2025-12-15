@@ -1224,6 +1224,7 @@ static void scroll_right_btn_cb(lv_event_t* e) {
 static pthread_mutex_t last_recv_mutex = PTHREAD_MUTEX_INITIALIZER;
 typedef struct {
     char mac[32];
+    float raw;      /* latest unfiltered percent */
     float filtered; /* EMA-filtered percent value (0..100) */
     int updated;
 } last_recv_entry_t;
@@ -1315,6 +1316,7 @@ void moisture_receive_sensor_values(const sensor_reading_t *readings, size_t cou
         int found = 0;
         for (int i = 0; i < last_recv_count; i++) {
             if (strncmp(last_recv[i].mac, sensor_mac, sizeof(last_recv[i].mac)) == 0) {
+                last_recv[i].raw = newf;
                 /* Apply EMA: filtered = alpha * new + (1-alpha) * old */
                 last_recv[i].filtered = smoothing_alpha * newf + (1.0f - smoothing_alpha) * last_recv[i].filtered;
                 last_recv[i].updated = 1;
@@ -1326,6 +1328,7 @@ void moisture_receive_sensor_values(const sensor_reading_t *readings, size_t cou
             strncpy(last_recv[last_recv_count].mac, sensor_mac, sizeof(last_recv[last_recv_count].mac)-1);
             last_recv[last_recv_count].mac[sizeof(last_recv[last_recv_count].mac)-1] = '\0';
             /* initialize filtered to first sample (no smoothing yet) */
+            last_recv[last_recv_count].raw = newf;
             last_recv[last_recv_count].filtered = newf;
             last_recv[last_recv_count].updated = 1;
             last_recv_count++;
@@ -1345,12 +1348,13 @@ static void moisture_apply_received_timer_cb(lv_timer_t* timer) {
     for (int j = 0; j < last_recv_count; j++) {
         if (!last_recv[j].updated) continue;
         const char *mac = last_recv[j].mac;
-        int moist = (int)roundf(last_recv[j].filtered);
+        int moist_display = (int)roundf(last_recv[j].filtered);
+        int moist_raw = (int)roundf(last_recv[j].raw);
         /* find plot */
         int found = 0;
         for (int i = 0; i < plot_count; i++) {
             if (strncmp(all_plots[i].sensor_mac, mac, sizeof(all_plots[i].sensor_mac)) == 0) {
-                all_plots[i].moisture = moist;
+                all_plots[i].moisture = moist_display;
                 found = 1;
                 break;
             }
@@ -1358,7 +1362,7 @@ static void moisture_apply_received_timer_cb(lv_timer_t* timer) {
         if (!found) {
             int idx = moisture_add_plot_for_sensor(mac);
             if (idx >= 0) {
-                all_plots[idx].moisture = moist;
+                all_plots[idx].moisture = moist_display;
             }
         }
         /* After updating moisture, decide whether to toggle D0 on the device. */
@@ -1369,7 +1373,8 @@ static void moisture_apply_received_timer_cb(lv_timer_t* timer) {
             int reported = server_get_output_state_for_mac(all_plots[plot_idx].sensor_mac);
             if (reported == 0 || reported == 1) plot_output_state[plot_idx] = reported;
 
-            int desired = (all_plots[plot_idx].moisture < all_plots[plot_idx].threshold) ? 1 : 0;
+            /* Use raw (unsmoothed) moisture for control decisions to avoid apparent EMA on thresholds. */
+            int desired = (moist_raw < all_plots[plot_idx].threshold) ? 1 : 0;
             if (desired != plot_output_state[plot_idx]) {
                 /* Try to send command to the device; ignore failure but log */
                 if (server_send_cmd_to_mac(all_plots[plot_idx].sensor_mac, desired) == 0) {
